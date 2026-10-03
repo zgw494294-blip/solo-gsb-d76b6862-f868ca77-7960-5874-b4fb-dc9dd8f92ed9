@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from . import storage as storage_module
 from .playback import (
     AcceptConflict,
+    AckOutOfRange,
+    ChannelExists,
+    ChannelMissing,
     CursorRegression,
     PlaybackManager,
     PlaybackSession,
@@ -42,10 +45,17 @@ app = FastAPI(
         "播放时可按 speaker 精确匹配临时隐藏指定说话人的字幕（仅影响该会话、"
         "不持久化），切换时按当前游标的活动区间返回 exit/enter 显示变更事件，"
         "隐藏后推进与事件推进的活动字幕及事件均排除隐藏者，游标照常推进。"
+        "显示端还可为会话开启补取通道：开启返回当前可见 active 与基线序号 0"
+        "（重复开启 409），此后普通推进、事件推进与隐藏切换产生的全部 "
+        "enter/exit 事件沿用事件字段与排序入队，seq 从 1 连续编号，"
+        "短字幕不漏记、接纳不重写已排队内容；丢响应后提交 ack_seq 补取，"
+        "返回确认位置与未确认事件（按 seq 递增、重复补取内容不变），"
+        "只能确认此前补取已返回的最大 seq 以内的前缀（越界 422、旧确认不回退）。"
         "播放结束可通过 finish 一次取回最终完整快照并释放会话：结束与推进、"
-        "事件推进、接纳、隐藏切换串行生效，结束后该会话 id 的一切请求均返回 404。"
+        "事件推进、接纳、隐藏切换、通道开启与补取串行生效，"
+        "结束后该会话 id 的一切请求均返回 404。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -355,6 +365,69 @@ class HiddenSpeakersResponse(BaseModel):
     hidden_speakers: List[str]
     events: List[SubtitleEventOut]
     active: List[ActiveSubtitleOut]
+
+
+# ---------------------------------------------------------------------------
+# 补取通道：请求/响应模型
+# ---------------------------------------------------------------------------
+
+
+class ChannelOpenResponse(BaseModel):
+    """开启补取通道：当前可见活动字幕与基线序号 0。
+
+    active 为开启时刻游标下可见的活动字幕（同 /advance，排除隐藏者）；
+    acked_seq 恒为 0——通道基线，此后事件从 seq 1 开始连续编号。
+    """
+
+    session_id: str
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    active: List[ActiveSubtitleOut]
+    acked_seq: int = Field(..., description="通道基线序号，恒为 0：此后事件从 seq 1 编号")
+
+
+class ChannelAckRequest(BaseModel):
+    """补取请求：确认已收到的前缀。
+
+    ack_seq 使用严格整数（strict）：布尔值（true/false 会被 Python 视为
+    int 子类）与数字字符串一律按 422 拒绝，不做隐式转换。
+    """
+
+    ack_seq: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description=(
+            "已收到的最大事件序号（非负整数，拒绝布尔值与字符串）；"
+            "只能确认此前补取已返回的最大 seq 以内的前缀"
+        ),
+    )
+
+
+class ChannelEventOut(BaseModel):
+    """通道事件：沿用事件推进的全部字段，另带从 1 连续编号的 seq。"""
+
+    seq: int = Field(..., description="通道内连续序号（从 1 开始）")
+    id: Union[str, int]
+    speaker: str
+    track: int
+    time_ms: int = Field(..., description="事件时刻（毫秒）：进入取 start_ms，退出取 end_ms")
+    type: Literal["enter", "exit"] = Field(
+        ..., description="进入（enter）或退出（exit）"
+    )
+
+
+class ChannelAckResponse(BaseModel):
+    """补取结果：确认位置与剩余（未确认）事件，按 seq 递增。
+
+    acked_seq 为确认后的当前确认位置（只前进不回退）；events 为 seq
+    大于确认位置的全部排队事件，内容与序号在重复补取时保持不变。
+    """
+
+    session_id: str
+    acked_seq: int
+    events: List[ChannelEventOut]
 
 
 # ---------------------------------------------------------------------------
@@ -982,6 +1055,77 @@ def set_hidden_speakers(
         # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
         raise _session_gone_404(session_id)
     return HiddenSpeakersResponse(**state)
+
+
+@app.post("/sessions/{session_id}/channel", response_model=ChannelOpenResponse)
+def open_session_channel(session_id: str) -> ChannelOpenResponse:
+    """为会话开启补取通道（单进程内存态，不持久化、不做后台推送）。
+
+    推进/事件推进/隐藏切换的响应一旦丢失，显示端可凭通道补取未确认
+    的字幕变更。开启返回当前可见 `active`（同 /advance 的活动字幕，
+    排除隐藏者）与基线序号 0：此后普通推进、事件推进与隐藏切换产生
+    的全部 enter/exit 事件沿用事件字段与排序入队，seq 从 1 连续编号
+    ——普通推进跨过的短字幕同样成对入队，接纳场景修订不会重写已排队
+    内容。
+
+    重复开启返回 409；未知或已结束会话返回 404。开启与既有会话操作
+    在会话锁内完整串行，失败不改会话或通道；结束会话清除通道。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().open_channel(session)
+    except SessionFinished:
+        raise _session_gone_404(session_id)
+    except ChannelExists:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "该会话已开启补取通道，重复开启被拒绝",
+                "session_id": session_id,
+            },
+        )
+    return ChannelOpenResponse(**state)
+
+
+@app.post(
+    "/sessions/{session_id}/channel/ack",
+    response_model=ChannelAckResponse,
+)
+def ack_session_channel(
+    session_id: str, req: ChannelAckRequest
+) -> ChannelAckResponse:
+    """补取未确认的字幕变更事件，并确认已收到的前缀。
+
+    请求体 `{"ack_seq": N}`：N 为非负整数（布尔值与字符串一律 422），
+    且只能确认此前补取已返回的最大 seq 以内的前缀——越界返回 422 且
+    通道不变；ack_seq 不大于当前确认位置时确认位置不回退（旧确认幂等
+    成功）。响应返回确认位置 `acked_seq` 与剩余未确认事件（各自带
+    seq，按 seq 递增）；事件只追加不重写，未确认事件重复补取的内容与
+    序号不变，客户端据此在去重后补全丢失的显示变更。
+
+    未知或已结束会话、未开启通道均返回 404；补取与既有会话操作在
+    会话锁内完整串行，失败不改会话或通道。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().ack_channel(session, req.ack_seq)
+    except SessionFinished:
+        raise _session_gone_404(session_id)
+    except ChannelMissing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"播放会话 {session_id!r} 未开启补取通道",
+        )
+    except AckOutOfRange as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "ack_seq 只能确认此前补取已返回的最大 seq 以内的前缀",
+                "ack_seq": exc.ack_seq,
+                "returned_seq": exc.returned_seq,
+            },
+        )
+    return ChannelAckResponse(**state)
 
 
 @app.post("/sessions/{session_id}/accept", response_model=SessionStateResponse)
