@@ -11,6 +11,7 @@
 - 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；裁剪数据全部取自与 `expected_revision` 一致的**同一份完整源快照**——读取快照时先核对版本（不符立即 409，绝不拿错配版本裁剪），提交前在同一事务内再核对一次（读取匹配后源被修订同样 409），目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422；失败不创建目标、不改源场景或播放会话。
 - 2～4 个已保存场景可按给定顺序**拼接（concat）为连续播放场景**：`POST /scenes/concat` 接收非空 `target_scene_id` 与 2～4 段（每段给出非空 `scene_id`、正整数 `expected_revision` 与正整数 `duration_ms`，同源可重复，整数拒绝布尔值和字符串）；各源轨道数须相同，每段时长不得小于该源字幕的最大 `end_ms`，拼接后字幕总数 ≤ 12。字幕起止时间加上之前各段时长之和，按段序、源顺序排列，id 为“段号:段内序号”（均从 1 起），speaker 不变，源实际分轨写入 `locked_track`，`changes` 按拼接后同说话人时间相邻字幕计算（跨段相邻计入）。读取与提交时均核对全部源版本，**提交核对和目标创建在同一事务内一同生效**：源不存在 404、版本不符或目标已占用 409、其余非法输入 422；失败不留目标、不改源及播放会话。成功保存为版本 1 并返回完整场景，可直接用原读取、修订及播放接口操作。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
+- 播放会话可开启一个**补取通道（channel）**，让显示端在**推进响应丢失后仍能补取未确认的字幕变更**：`POST /sessions/{id}/channel` 每会话开启一个内存通道（重复开启 409），返回当前可见 `active` 与序号 0；此后普通推进、事件推进与隐藏切换产生的全部 enter/exit 按事件字段与排序入队，`seq` 从 1 连续编号，短字幕不漏记，接纳不重写已排队内容。`POST /sessions/{id}/channel/fetch` 提交 `ack_seq`（严格非负整数，拒绝布尔值与字符串）补取：只能确认此前补取已返回的最大 `seq` 以内的前缀（越界 422，旧确认不回退），返回确认位置与剩余未确认事件（按 `seq` 递增，重复补取内容与序号不变）。状态变更与入队一同生效，开启、补取与既有会话操作完整串行，失败不改会话或通道；结束会话清除通道，未知或已结束会话、未开启通道均 404。通道仅内存态：不跨重启恢复、不做后台推送，旧接口响应不变。
 
 ## 一条命令启动
 
@@ -1395,6 +1396,160 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/
   -H 'Content-Type: application/json' -d '{"hidden_speakers": ["Alice"]}'           # 404
 ```
 
+## 补取通道（channel）：推进响应丢失后补取未确认的字幕变更
+
+`/events` 与 `/hidden_speakers` 的事件只随当次响应返回，不保存历史；若显示端遇到**推进响应丢失**（网络超时、连接中断等），错过的字幕变更无从得知。补取通道为此提供一条会话内的内存事件队列：开启后，会话产生的全部 enter/exit 都按序入队，显示端随时补取未确认的事件并按序号确认。
+
+- `POST /sessions/{session_id}/channel`：**开启通道**（无请求体）。每个会话最多一个内存通道，重复开启返回 **409**（已有通道不变）。成功响应返回当前可见 `active`（与 `/advance` 相同、排除隐藏说话人）与序号 `seq: 0`——开启之前的事件不补记，客户端以本响应的 `active` 作为初始可见集合。未知或已结束会话返回 404。
+- 开启后，**普通推进（`/advance`）、事件推进（`/events`）与隐藏切换（`/hidden_speakers`）产生的全部 enter/exit** 都追加到通道队列：事件字段与排序沿用事件推进的规则（`id`/`speaker`/`track`/`time_ms`/`type`，时刻升序、同刻先退出后进入、同类按会话字幕顺序；隐藏切换的事件时刻为当前游标），每条事件分配**从 1 起连续递增的 `seq`**。普通推进的响应不变（仍不含 `events`），但它跨过的进入/退出——包括两次采样之间开始又结束的短字幕——同样完整入队；隐藏说话人的字幕不产生事件，也不入队。**接纳（`/accept`）不重写已排队内容**：队列中的事件保持入队时的内容与序号，接纳后的新事件继续递增编号。状态变更（游标推进、隐藏集合替换）与入队在同一会话锁内一同生效；开启、补取与既有会话操作完整串行；任何失败都不改会话或通道。
+- `POST /sessions/{session_id}/channel/fetch`：**补取并确认**。请求体 `{"ack_seq": N}`：
+  - `ack_seq` 为**非负整数**，布尔值与字符串一律 **422**（严格整数，不做隐式转换）；
+  - 只能确认**此前补取已返回的最大 `seq` 以内**的前缀：`ack_seq` 超过该上限返回 **422** 且通道不变；小于等于已确认位置的**旧确认不回退**（确认位置只增）；
+  - 成功响应返回**确认位置 `acked_seq` 与剩余未确认事件**（`seq > acked_seq`，按 `seq` 递增）；已确认前缀随即丢弃，未确认事件**重复补取时内容与序号不变**——推进响应丢失后，用上次已确认的 `ack_seq` 重试即可拿到完全相同的剩余事件。
+- 结束会话（`/finish`）**清除通道**；未知或已结束会话、未开启通道的补取均返回 **404**。通道只存在于会话内存中：**不跨重启恢复、不做后台推送**（拉取式）；旧接口（创建/推进/事件推进/隐藏切换/接纳/结束）的响应完全不变。
+
+### 示例 26：开启通道与丢响应后补取
+
+创建场景 `scene-chan`（s1 `[0,1000)`、s2 `[800,3000)` 锁轨 2、s3 `[1000,2500)`，分轨 1/2/1）并创建会话，然后开启补取通道：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/scene-chan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-chan"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+# 开启通道：游标 0 处仅 s1 可见，序号 0（首个事件将为 seq 1）
+curl -s -X POST http://localhost:8080/sessions/$SID/channel
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-chan",
+  "source_revision": 1,
+  "cursor_ms": 0,
+  "seq": 0,
+  "active": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000, "locked_track": null, "track": 1}
+  ]
+}
+```
+
+正常播放：先用 `/advance` 推进到 900（响应仍是原样、不含事件，但 s2 的 800 进入已入队为 seq 1），再用 `/events` 推进到 1000——**假设这次响应丢失**（s1 退出、s3 进入已入队为 seq 2、3）：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 900}' >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'   # 响应丢失！
+```
+
+丢响应后补取：以上次确认位置 `ack_seq: 0` 重取，拿到全部未确认事件（含普通推进记录的那条）：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-chan",
+  "acked_seq": 0,
+  "events": [
+    {"seq": 1, "id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 800,  "type": "enter"},
+    {"seq": 2, "id": "s1", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "exit"},
+    {"seq": 3, "id": "s3", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "enter"}
+  ]
+}
+```
+
+若这次补取响应也丢失，用同样的 `ack_seq: 0` 重试，内容与序号完全相同；确认已收到前 3 条后，剩余事件为空：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 3}'
+# {"session_id":"…","scene_id":"scene-chan","acked_seq":3,"events":[]}
+```
+
+### 示例 27：确认边界与隐藏切换的记录
+
+接上例（游标 1000、已确认到 seq 3）。隐藏 Alice：游标处 s3 活动，可见→隐藏发 `exit`（时刻取当前游标），该事件入队为 seq 4；隐藏期间事件推进到 3000，Alice 的事件被排除，只记录 s2 的 3000 退出（seq 5）：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/hidden_speakers \
+  -H 'Content-Type: application/json' -d '{"hidden_speakers": ["Alice"]}' >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 3000}' >/dev/null
+
+# 补取：ack 3 确认旧位置，返回 seq 4、5（按 seq 递增）
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 3}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-chan",
+  "acked_seq": 3,
+  "events": [
+    {"seq": 4, "id": "s3", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "exit"},
+    {"seq": 5, "id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 3000, "type": "exit"}
+  ]
+}
+```
+
+**确认边界**：只能确认此前补取已返回的最大 `seq`（上例已返回到 5）；越界 422 且通道不变，旧确认不回退：
+
+```bash
+# 越界：ack 6 超过已返回的最大 seq 5
+curl -s -i -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 6}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":{"message":"ack_seq 越界：只能确认此前补取已返回的最大 seq 以内的前缀",
+#            "ack_seq":6,"max_returned_seq":5}}
+
+# 旧确认不回退：ack 2 小于已确认位置 3，确认位置保持 3，仍返回 seq 4、5
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 2}'
+# {"session_id":"…","scene_id":"scene-chan","acked_seq":3,"events":[seq 4, seq 5]}
+
+# 确认到 5：队列清空
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 5}'
+# {"session_id":"…","scene_id":"scene-chan","acked_seq":5,"events":[]}
+
+# ack_seq 拒绝布尔值与字符串（严格整数，不做隐式转换）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": true}'    # 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": "5"}'     # 422
+```
+
+**生命周期**：每会话只能开启一个通道（重复开启 409）；结束会话清除通道，此后开启与补取均 404；未开启通道的会话补取同样 404：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/channel
+# 409（重复开启）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/finish
+# 200（结束并清除通道）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'        # 404（会话已结束）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/channel
+# 404（会话已结束）
+```
+
 健康检查：
 
 ```bash
@@ -1436,10 +1591,10 @@ python tests/test_solver.py
 
 ```
 app/
-  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat 与会话结束 /sessions/{id}/finish
+  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat、会话结束 /sessions/{id}/finish 与补取通道 /sessions/{id}/channel(/fetch)
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段/拼接核对全部源版本与创建目标为同一事务）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认）与保轨重算
 tests/
   conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py         # 求解器单元测试
@@ -1450,6 +1605,7 @@ tests/
   test_playback.py       # 播放会话创建/推进/接纳/冲突/并发测试
   test_hidden_speakers.py # 临时隐藏说话人：切换事件顺序、推进/事件排除、接纳保留、快照不变、404/422、串行化
   test_finish.py         # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错
+  test_channel.py        # 补取通道：开启/重复开启、三类操作入队与短字幕、ack 边界与不回退、重复补取不变、结束清除、404/409/422、串行化
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

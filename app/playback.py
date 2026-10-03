@@ -31,11 +31,19 @@
   纳入尚未接纳的场景修订。成功响应沿用创建会话的全部字段。结束后该会话
   ID 的一切请求（含已取得会话引用、在锁上等待的在途请求）均返回 404，
   并发结束最多一次成功。结束不改动源场景、其他会话或此前返回的快照，
-  不保存结束记录，也不跨重启恢复。
+  不保存结束记录，也不跨重启恢复。结束同时清除该会话的补取通道。
+- 补取通道（channel）：每个会话可开启一个内存通道（重复开启 409），
+  开启响应给出当前可见 active 与序号 0；此后普通推进、事件推进与隐藏
+  切换产生的全部 enter/exit 按事件字段与排序入队，seq 从 1 连续编号，
+  短字幕不漏记，接纳不重写已排队内容。补取提交 ack_seq（严格非负整数），
+  只能确认此前补取已返回的最大 seq 以内的前缀（越界 422，旧确认不回退），
+  返回确认位置与剩余未确认事件（按 seq 递增，重复补取内容与序号不变）。
+  状态变更与入队在同一会话锁内一同生效，开启、补取与既有会话操作完整
+  串行，失败不改会话或通道。通道仅内存态：不跨重启恢复、不做后台推送。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
-隐藏切换、接纳与结束通过会话级互斥锁串行化：每次调用要么完整生效，
-要么完全无效。
+隐藏切换、接纳、结束与补取通道的开启/补取通过会话级互斥锁串行化：
+每次调用要么完整生效，要么完全无效。
 接纳是一个完整操作——场景快照的读取（load_record 回调）、已开始字幕
 校验、分轨重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求
 读到的一定是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的
@@ -103,6 +111,51 @@ class SessionFinished(Exception):
         super().__init__(f"播放会话 {session_id!r} 已结束")
 
 
+class ChannelExists(Exception):
+    """该会话已开启补取通道，重复开启（对应 HTTP 409）。"""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"播放会话 {session_id!r} 已开启补取通道")
+
+
+class ChannelMissing(Exception):
+    """该会话尚未开启补取通道（对应 HTTP 404）。"""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"播放会话 {session_id!r} 尚未开启补取通道")
+
+
+class AckOutOfRange(Exception):
+    """ack_seq 超过此前补取已返回的最大 seq（对应 HTTP 422，通道不变）。"""
+
+    def __init__(self, ack_seq: int, max_returned_seq: int) -> None:
+        self.ack_seq = ack_seq
+        self.max_returned_seq = max_returned_seq
+        super().__init__(
+            f"ack_seq={ack_seq} 越界：此前补取已返回的最大 seq 为 "
+            f"{max_returned_seq}"
+        )
+
+
+@dataclass
+class ChannelState:
+    """补取通道的内存状态（仅属于会话，不持久化、不跨重启保留）。
+
+    events 为尚未确认的已排队事件：每项含 seq 与事件推进的事件字段
+    （id/speaker/track/time_ms/type），按 seq 递增；next_seq 为下一个
+    事件序号（从 1 起连续编号）；acked_seq 为确认位置（已确认的最大
+    序号，只增不回退）；max_returned_seq 为此前补取响应实际返回过的
+    最大 seq——ack_seq 不得超过它，越界按 422 拒绝。
+    """
+
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    next_seq: int = 1
+    acked_seq: int = 0
+    max_returned_seq: int = 0
+
+
 @dataclass
 class PlaybackSession:
     """一次播放会话的内存状态；subtitles 与 tracks 按下标对齐。"""
@@ -118,6 +171,9 @@ class PlaybackSession:
     # 临时隐藏的说话人集合：按 speaker 精确匹配，仅影响本会话的
     # active/events 视图；默认空，接纳后保留，不随会话持久化。
     hidden_speakers: set = field(default_factory=set)
+    # 补取通道：开启后记录普通推进/事件推进/隐藏切换产生的全部
+    # enter/exit；仅内存态，未开启为 None，结束会话时清除。
+    channel: Optional[ChannelState] = None
     # 结束墓碑：finish 在会话锁内置为 True 并移除注册表条目。此后即使
     # 仍持有本对象引用的在途请求，在锁内读到 closed 也一律按 404 失败。
     closed: bool = False
@@ -164,6 +220,60 @@ def _identity(sub: Dict[str, Any]) -> Tuple[Any, ...]:
     )
 
 
+def _window_events(
+    session: PlaybackSession, old_cursor: int, time_ms: int
+) -> List[Dict[str, Any]]:
+    """（旧游标, time_ms] 窗口内的全部进入/退出事件（排除隐藏说话人）。
+
+    字幕在 start_ms 进入、end_ms 退出（区间左闭右开）；一次采样间隔内
+    开始又结束的短字幕会同时给出进入与退出，不会漏。排序与事件推进一致：
+    时刻升序，同刻先退出后进入，同类按会话字幕顺序。
+    """
+    # 每项为 (时刻, 同刻次序, 会话顺序, 事件体)；同刻次序令 exit 在前
+    pending: List[Tuple[int, int, int, Dict[str, Any]]] = []
+    hidden = session.hidden_speakers
+    for order, (sub, track) in enumerate(
+        zip(session.subtitles, session.tracks)
+    ):
+        # 隐藏说话人的字幕既不进入 active，也不产生进入/退出事件
+        if sub["speaker"] in hidden:
+            continue
+        start_ms = sub["start_ms"]
+        end_ms = sub["end_ms"]
+        base = {
+            "id": sub["id"],
+            "speaker": sub["speaker"],
+            "track": track,
+        }
+        if old_cursor < start_ms <= time_ms:
+            pending.append(
+                (start_ms, 1, order, {**base, "time_ms": start_ms, "type": "enter"})
+            )
+        if old_cursor < end_ms <= time_ms:
+            pending.append(
+                (end_ms, 0, order, {**base, "time_ms": end_ms, "type": "exit"})
+            )
+    pending.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in pending]
+
+
+def _channel_enqueue(
+    session: PlaybackSession, events: List[Dict[str, Any]]
+) -> None:
+    """把本次操作产生的事件按序追加到补取通道（未开启则为无操作）。
+
+    与产生事件的状态变更（游标推进、隐藏集合替换）在同一会话锁内一同
+    生效：seq 从 1 起连续分配；已排队内容自此不被改写（接纳场景修订
+    也不影响）。调用方须已持有会话锁。
+    """
+    channel = session.channel
+    if channel is None:
+        return
+    for event in events:
+        channel.events.append({"seq": channel.next_seq, **event})
+        channel.next_seq += 1
+
+
 class PlaybackManager:
     """会话注册表：单进程内存实现，不持久化、不跨重启保留。
 
@@ -199,13 +309,26 @@ class PlaybackManager:
             return self._sessions.get(session_id)
 
     def advance(self, session: PlaybackSession, time_ms: int) -> Dict[str, Any]:
-        """推进游标（只能不减），返回源版本、游标与活动字幕及轨道。"""
+        """推进游标（只能不减），返回源版本、游标与活动字幕及轨道。
+
+        响应保持原样（不含事件）；若已开启补取通道，本次推进跨过的全部
+        进入/退出事件（与事件推进同一窗口与排序，短字幕不漏记）在游标
+        更新的同一会话锁内一并入队。
+        """
         with session.lock:
             if session.closed:
                 raise SessionFinished(session.session_id)
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
+            old_cursor = session.cursor_ms
+            # 普通推进的响应不含事件，但补取通道要完整记录跨过的 enter/exit
+            pending = (
+                _window_events(session, old_cursor, time_ms)
+                if session.channel is not None
+                else []
+            )
             session.cursor_ms = time_ms
+            _channel_enqueue(session, pending)
             return {
                 "session_id": session.session_id,
                 "scene_id": session.scene_id,
@@ -229,7 +352,8 @@ class PlaybackManager:
         事件生成、游标更新与活动字幕计算基于同一份会话快照，在会话锁
         内一次完成，与推进、接纳、结束完整串行。倒退抛 CursorRegression，
         会话保持不变。事件不保存历史、不提供重放。隐藏说话人的字幕不
-        进入 active，也不产生事件；游标仍照常推进。
+        进入 active，也不产生事件；游标仍照常推进。若已开启补取通道，
+        本次事件在游标更新的同一会话锁内按序入队。
         """
         with session.lock:
             if session.closed:
@@ -237,33 +361,9 @@ class PlaybackManager:
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
             old_cursor = session.cursor_ms
-            # 每项为 (时刻, 同刻次序, 会话顺序, 事件体)；同刻次序令 exit 在前
-            pending: List[Tuple[int, int, int, Dict[str, Any]]] = []
-            hidden = session.hidden_speakers
-            for order, (sub, track) in enumerate(
-                zip(session.subtitles, session.tracks)
-            ):
-                # 隐藏说话人的字幕既不进入 active，也不产生进入/退出事件
-                if sub["speaker"] in hidden:
-                    continue
-                start_ms = sub["start_ms"]
-                end_ms = sub["end_ms"]
-                base = {
-                    "id": sub["id"],
-                    "speaker": sub["speaker"],
-                    "track": track,
-                }
-                if old_cursor < start_ms <= time_ms:
-                    pending.append(
-                        (start_ms, 1, order, {**base, "time_ms": start_ms, "type": "enter"})
-                    )
-                if old_cursor < end_ms <= time_ms:
-                    pending.append(
-                        (end_ms, 0, order, {**base, "time_ms": end_ms, "type": "exit"})
-                    )
-            pending.sort(key=lambda item: (item[0], item[1], item[2]))
-            events = [item[3] for item in pending]
+            events = _window_events(session, old_cursor, time_ms)
             session.cursor_ms = time_ms
+            _channel_enqueue(session, events)
             return {
                 "session_id": session.session_id,
                 "scene_id": session.scene_id,
@@ -329,6 +429,8 @@ class PlaybackManager:
                 item[1] for item in enters
             ]
             session.hidden_speakers = new_hidden
+            # 与隐藏集合的替换一同生效：显示变更事件同步入队（未开启则无操作）
+            _channel_enqueue(session, events)
             return {
                 "session_id": session.session_id,
                 "scene_id": session.scene_id,
@@ -338,6 +440,67 @@ class PlaybackManager:
                 "hidden_speakers": list(hidden_speakers),
                 "events": events,
                 "active": session.active(),
+            }
+
+    def open_channel(self, session: PlaybackSession) -> Dict[str, Any]:
+        """为会话开启补取通道：返回当前可见活动字幕与起始序号 0。
+
+        每个会话最多一个通道，重复开启抛 ChannelExists（409，已有通道
+        不变）。开启只建立空队列，不补记开启之前的事件——客户端以本响应
+        的 active 作为初始可见集合，此后的 enter/exit 由通道记录。与
+        既有会话操作在会话锁内完整串行；会话已结束抛 SessionFinished。
+        """
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            if session.channel is not None:
+                raise ChannelExists(session.session_id)
+            session.channel = ChannelState()
+            return {
+                "session_id": session.session_id,
+                "scene_id": session.scene_id,
+                "source_revision": session.source_revision,
+                "cursor_ms": session.cursor_ms,
+                "seq": 0,
+                "active": session.active(),
+            }
+
+    def fetch_channel(
+        self, session: PlaybackSession, ack_seq: int
+    ) -> Dict[str, Any]:
+        """补取未确认事件并确认已收到的事件前缀。
+
+        ack_seq 只能确认此前补取已返回的最大 seq 以内的前缀：越界抛
+        AckOutOfRange（422，通道不变）；小于等于已确认位置的旧确认不
+        回退。成功时确认位置前进到 max(acked_seq, ack_seq)，丢弃已确认
+        前缀，返回确认位置与剩余未确认事件（按 seq 递增；内容与序号自
+        入队起不变，重复补取结果相同），并把“已返回的最大 seq”推进到
+        本次返回的末尾。未开启通道抛 ChannelMissing（404）；会话已结束
+        抛 SessionFinished（404）。与既有会话操作在会话锁内完整串行。
+        """
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            channel = session.channel
+            if channel is None:
+                raise ChannelMissing(session.session_id)
+            if ack_seq > channel.max_returned_seq:
+                raise AckOutOfRange(ack_seq, channel.max_returned_seq)
+            if ack_seq > channel.acked_seq:
+                channel.acked_seq = ack_seq
+            # 丢弃已确认前缀；剩余事件保持入队时的内容与序号、按 seq 递增
+            if channel.events and channel.events[0]["seq"] <= channel.acked_seq:
+                channel.events = [
+                    e for e in channel.events if e["seq"] > channel.acked_seq
+                ]
+            remaining = [dict(e) for e in channel.events]
+            if remaining:
+                channel.max_returned_seq = remaining[-1]["seq"]
+            return {
+                "session_id": session.session_id,
+                "scene_id": session.scene_id,
+                "acked_seq": channel.acked_seq,
+                "events": remaining,
             }
 
     def accept(
@@ -446,6 +609,8 @@ class PlaybackManager:
             if session.closed:
                 raise SessionFinished(session_id)
             session.closed = True
+            # 结束会话清除补取通道（通道本就只是会话内存态）
+            session.channel = None
             with self._registry_lock:
                 # 注册表条目即本对象；以 closed 为准，防御性地按 id 移除
                 self._sessions.pop(session_id, None)
